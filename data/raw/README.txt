@@ -1,0 +1,1 @@
+NexaCorp fictional company knowledge base. Ingest all files. Treat effective/current approved documents as authoritative over superseded or draft content. Do not assume source contents are true outside this exercise. Source metadata should include filename and precise location.

@@ -1,0 +1,25 @@
+{
+  "contracts": [
+    {
+      "client": "Aster Retail",
+      "project_id": "OR-101",
+      "p1_response_minutes": 30,
+      "p2_response_hours": 2,
+      "currency": "USD"
+    },
+    {
+      "client": "Cobalt Logistics",
+      "project_id": "NE-303",
+      "p1_response_minutes": 20,
+      "p2_response_hours": 4,
+      "currency": "USD"
+    },
+    {
+      "client": "Boreal Health",
+      "project_id": "AT-202",
+      "p1_response_minutes": 60,
+      "p2_response_hours": 3,
+      "currency": "USD"
+    }
+  ]
+}

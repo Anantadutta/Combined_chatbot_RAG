@@ -1,0 +1,5 @@
+Operations notes 2026-10-01
+Ticket INC-101: Client Aster Retail, P1, opened 09:00, acknowledged 09:24; contractual SLA 30 min.
+Ticket INC-102: Client Cobalt Logistics, P1, opened 10:00, acknowledged 10:27; contractual SLA 20 min.
+Ticket INC-103: Client Boreal Health, P1, opened 11:00, acknowledged 11:45; contractual SLA 60 min.
+Company internal P1 standard is 15 minutes, separate from customer contractual SLA.

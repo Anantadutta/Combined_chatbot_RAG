@@ -1,0 +1,7 @@
+employee_id,name,department,skill,project_id
+E01,Maya Rao,Delivery,Scrum,OR-101
+E02,Dev Mehta,Engineering,Python,OR-101
+E03,Priya Nair,QA,Automation,OR-101
+E04,Nina Shah,Delivery,Planning,NE-303
+E05,Ishita Bose,Engineering,FastAPI,NE-303
+E06,Arjun Patel,Delivery,Cloud,PH-404

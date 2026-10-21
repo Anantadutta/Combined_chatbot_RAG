@@ -12,11 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Settings, load_settings
-from ..ingestion import IngestResult, ingest_bytes, ingest_directory
+from ..ingestion import SUPPORTED_EXTENSIONS, IngestResult, ingest_bytes, ingest_directory
+from ..ingestion.metadata import doc_id_for
+from ..ingestion.pipeline import sha256_of
 from ..retrieval import (CachedEmbedder, GeminiEmbedder, GeminiReranker, HashEmbedder, HybridRetriever,
                          LocalReranker, NoReranker, VectorStore)
 from ..retrieval.hybrid import Candidate
 from ..retrieval.text import tokenize
+from .conversation import Turn, history_text, rewrite_question
 from .guardrails import (Intent, answer_flags, apply_authority_policy, build_supersession_links, detect_intent,
                          leaks_system_prompt)
 from .prompts import SYSTEM_PROMPT, build_prompt
@@ -52,12 +55,16 @@ class Answer:
     model: str | None = None
     flags: list[str] = field(default_factory=list)
     reasoning: str | None = None  # model scratchpad: kept for debugging (--json), never shown in the answer
+    standalone_question: str | None = None  # follow-up rewritten for retrieval (multi-turn chat)
+    rewrite: str = "none"  # how the follow-up was rewritten: none | llm | heuristic
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def format(self, show_sources: bool = False) -> str:
         lines = [self.answer, ""]
+        if self.rewrite != "none" and self.standalone_question:
+            lines.insert(0, f"(interpreted as: {self.standalone_question})")
         if self.flags:
             lines.insert(1, f"[flags: {', '.join(self.flags)}]")
         for c in self.citations:
@@ -125,7 +132,7 @@ class RAGEngine:
             self.reranker = NoReranker()
         else:
             self.reranker = LocalReranker()
-        self._index_lock = threading.Lock()
+        self._index_lock = threading.RLock()  # one writer at a time; readers never wait for it
 
     # ------------------------------------------------------------------ indexing
     def index_results(self, results: list[IngestResult]) -> int:
@@ -144,18 +151,140 @@ class RAGEngine:
             self.index_results([result])
         return result
 
-    def delete_document(self, doc_id: str) -> None:
+    # ------------------------------------------------------------------ document library
+    # Sources of truth: data/raw (the corpus) + data/uploads (added through the API/UI; a file there
+    # overrides a corpus file with the same name). Deleting a corpus file records a "tombstone" so that
+    # a later reindex does not bring it back.
+    @property
+    def _tombstone_file(self) -> Path | None:
+        return None if self.settings.qdrant_path == ":memory:" else Path(self.settings.index_dir) / "deleted.json"
+
+    def _tombstones(self) -> set[str]:
+        f = self._tombstone_file
+        if f is None:
+            return getattr(self, "_mem_tombstones", set())
+        try:
+            return set(json.loads(f.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return set()
+
+    def _save_tombstones(self, names: set[str]) -> None:
+        f = self._tombstone_file
+        if f is None:
+            self._mem_tombstones = set(names)
+            return
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(sorted(names), indent=2), encoding="utf-8")
+
+    def source_files(self) -> dict[str, Path]:
+        """filename -> path of every document that should be in the index."""
+        files: dict[str, Path] = {}
+        for folder in (self.settings.data_dir, self.settings.uploads_dir):  # uploads win on name clashes
+            d = Path(folder)
+            if d.is_dir():
+                for p in sorted(d.rglob("*")):
+                    if p.is_file() and not p.name.startswith("."):
+                        files[p.name] = p
+        dead = self._tombstones()
+        return {name: p for name, p in files.items() if name not in dead}
+
+    def documents(self) -> list[dict[str, Any]]:
+        docs: dict[str, dict] = {}
+        uploads = Path(self.settings.uploads_dir)
+        for p in list(self.retriever.payloads.values()):
+            d = docs.get(p["doc_id"])
+            if d is None:
+                d = docs[p["doc_id"]] = {
+                    "doc_id": p["doc_id"], "filename": p["filename"], "file_type": p.get("file_type"),
+                    "status": p.get("status"), "authoritative": p.get("authoritative"),
+                    "category": p.get("category"), "title": p.get("title"),
+                    "effective_date": p.get("effective_date"), "superseded_date": p.get("superseded_date"),
+                    "sha256": p.get("doc_sha256"), "chunks": 0,
+                    "source": "upload" if (uploads / p["filename"]).is_file() else "corpus",
+                }
+            d["chunks"] += 1
+        links = self.supersession_links()
+        for d in docs.values():
+            if d["doc_id"] in links:
+                d["superseded_by"] = links[d["doc_id"]]["by"]
+        return sorted(docs.values(), key=lambda d: d["filename"].lower())
+
+    def get_document(self, doc_id: str) -> dict[str, Any] | None:
+        return next((d for d in self.documents() if d["doc_id"] == doc_id), None)
+
+    def add_document(self, data: bytes, filename: str, expect_doc_id: str | None = None) -> dict[str, Any]:
+        """Upload or update one file. Returns the ingestion report plus an `action`:
+
+        created | updated | unchanged (same name, same bytes) | duplicate (same bytes, other name) |
+        failed (malformed / empty / too large) | skipped (unsupported type) | rejected (wrong doc id).
+        """
+        filename = Path(str(filename or "")).name.strip()
+        doc_id = doc_id_for(filename) if filename else ""
+        if expect_doc_id is not None and doc_id != expect_doc_id:
+            return {"filename": filename, "doc_id": doc_id, "action": "rejected", "status": "failed",
+                    "error": f"file name must match the document being updated ({expect_doc_id})", "n_chunks": 0}
         with self._index_lock:
+            existing = self.get_document(doc_id) if doc_id else None
+            sha = sha256_of(data)
+            if existing and existing["sha256"] == sha:
+                return {"filename": filename, "doc_id": doc_id, "action": "unchanged", "status": "ok",
+                        "sha256": sha, "n_chunks": existing["chunks"], "doc_status": existing["status"],
+                        "error": None}
+            others = {d["sha256"]: d["filename"] for d in self.documents() if d["doc_id"] != doc_id and d["sha256"]}
+            result = ingest_bytes(data, filename or "(no name)", known_hashes=others)
+            report = result.summary()
+            if result.status != "ok":
+                report["action"] = result.status
+                return report
+            self.index_results([result])
+            self._store_upload(filename, data)
+            dead = self._tombstones()
+            if filename in dead:
+                self._save_tombstones(dead - {filename})
+            report["action"] = "updated" if existing else "created"
+            return report
+
+    def _store_upload(self, filename: str, data: bytes) -> None:
+        folder = Path(self.settings.uploads_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / f".{filename}.tmp"
+        tmp.write_bytes(data)
+        tmp.replace(folder / filename)
+
+    def delete_document(self, doc_id: str) -> dict[str, Any] | None:
+        """Remove a document from the index (and its uploaded file). Returns what was deleted, or None."""
+        with self._index_lock:
+            doc = self.get_document(doc_id)
+            if doc is None:
+                return None
             self.retriever.delete_doc(doc_id)
+            upload = Path(self.settings.uploads_dir) / doc["filename"]
+            if upload.is_file():
+                upload.unlink()
+            if (Path(self.settings.data_dir) / doc["filename"]).is_file():
+                self._save_tombstones(self._tombstones() | {doc["filename"]})
+            return doc
+
+    def reindex(self) -> list[IngestResult]:
+        """Rebuild the index from data/raw + data/uploads (minus deleted files). Embeddings come from cache."""
+        with self._index_lock:
+            known: dict[str, str] = {}
+            files = self.source_files()
+            results = [ingest_bytes(p.read_bytes(), name, known) for name, p in sorted(files.items())]
+            keep = {r.doc_id for r in results if r.status == "ok"}
+            for d in self.documents():
+                if d["doc_id"] not in keep:
+                    self.retriever.delete_doc(d["doc_id"])
+            self.index_results(results)
+            return results
 
     def stats(self) -> dict[str, Any]:
-        docs: dict[str, dict] = {}
-        for p in self.retriever.payloads.values():
-            d = docs.setdefault(p["doc_id"], {"doc_id": p["doc_id"], "filename": p["filename"],
-                                              "status": p["status"], "chunks": 0})
-            d["chunks"] += 1
-        return {"chunks": len(self.retriever.payloads), "documents": sorted(docs.values(), key=lambda d: d["filename"]),
-                **self.settings.describe()}
+        docs = self.documents()
+        by_status: dict[str, int] = {}
+        for d in docs:
+            by_status[d["status"]] = by_status.get(d["status"], 0) + 1
+        return {"chunks": len(self.retriever.payloads), "n_documents": len(docs), "by_status": by_status,
+                "documents": docs, "supported_types": sorted(SUPPORTED_EXTENSIONS), **self.settings.describe()}
 
     # ------------------------------------------------------------------ answering
     def retrieve(self, question: str, filters: dict | None = None, top_k: int | None = None,
@@ -180,7 +309,8 @@ class RAGEngine:
             self._links_for = payloads
         return self._links
 
-    def ask(self, question: str, filters: dict | None = None, top_k: int | None = None) -> Answer:
+    def ask(self, question: str, filters: dict | None = None, top_k: int | None = None,
+            history: list[Turn] | None = None) -> Answer:
         start = time.perf_counter()
         question = (question or "").strip()
         if not question:
@@ -188,8 +318,18 @@ class RAGEngine:
         if len(question) > MAX_QUESTION_CHARS:
             raise ValueError(f"question is longer than {MAX_QUESTION_CHARS} characters")
 
-        intent = detect_intent(question)
-        top, timings = self.retrieve(question, filters, top_k, intent)
+        # multi-turn: resolve "it / that / the previous one" before searching
+        timings: dict[str, float] = {}
+        standalone, method = question, "none"
+        if history and self.settings.rewrite_follow_ups:
+            t_rw = time.perf_counter()
+            standalone, method = rewrite_question(question, history, self.llm)
+            timings["rewrite"] = (time.perf_counter() - t_rw) * 1000
+
+        intent = detect_intent(standalone)
+        intent.injection = intent.injection or detect_intent(question).injection
+        top, t_retrieval = self.retrieve(standalone, filters, top_k, intent)
+        timings.update(t_retrieval)
         sources = [(f"S{i}", c) for i, c in enumerate(top, start=1)]
 
         t_gen = time.perf_counter()
@@ -197,17 +337,19 @@ class RAGEngine:
         if not top:
             data = {"answer": NO_ANSWER, "citations": [], "abstained": True, "confidence": "high"}
         elif self.llm is None:
-            data = self._extractive_answer(question, sources)
+            data = self._extractive_answer(standalone, sources)
         else:
             try:
-                prompt = build_prompt(question, sources, dt.date.today().isoformat(), self.supersession_links(),
-                                      injection_suspected=intent.injection)
+                asked = question if method == "none" else f"{question}\n(standalone form: {standalone})"
+                prompt = build_prompt(asked, sources, dt.date.today().isoformat(), self.supersession_links(),
+                                      injection_suspected=intent.injection,
+                                      history=history_text(history) if history else None)
                 raw = self.llm.generate(SYSTEM_PROMPT, prompt, temperature=self.settings.temperature)
                 data = parse_llm_json(raw)
                 model = getattr(self.llm, "last_model_used", None)
             except Exception as exc:  # Gemini down / quota exhausted: degrade instead of crashing
                 log.error("generation failed, returning best passage instead: %s", exc)
-                data = self._extractive_answer(question, sources)
+                data = self._extractive_answer(standalone, sources)
                 if not data["abstained"]:
                     data["answer"] = ("(The AI model is unavailable right now, so this is the most relevant passage "
                                       "from the documents.) " + data["answer"])
@@ -216,6 +358,8 @@ class RAGEngine:
 
         answer = self._finalise(question, data, sources, intent)
         answer.model = model
+        answer.standalone_question = standalone if method != "none" else None
+        answer.rewrite = method
         timings["total"] = (time.perf_counter() - start) * 1000
         answer.timings_ms = {k: round(v, 1) for k, v in timings.items()}
         return answer

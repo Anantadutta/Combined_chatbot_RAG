@@ -6,5 +6,6 @@ venv/
 .env
 data/processed/
 data/index/
+data/uploads/
 *.egg-info/
 .DS_Store

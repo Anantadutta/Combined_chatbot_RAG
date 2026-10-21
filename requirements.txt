@@ -10,5 +10,11 @@ qdrant-client==1.19.1
 numpy>=1.26
 python-dotenv==1.2.3
 
+# Step 4 - API + web UI
+fastapi==0.156.5
+uvicorn==0.54.0
+python-multipart==0.0.32
+
 # testing
 pytest==9.1.1
+httpx==0.28.1

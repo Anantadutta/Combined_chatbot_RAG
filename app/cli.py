@@ -3,7 +3,8 @@
     python -m app.cli check                      # test the Gemini key and models
     python -m app.cli index                      # parse, chunk, embed and store data/raw
     python -m app.cli ask "How many WFH days?"   # one question -> cited answer
-    python -m app.cli chat                       # ask questions in a loop
+    python -m app.cli chat                       # multi-turn chat in the terminal
+    python -m app.cli serve                      # web UI + REST API on http://127.0.0.1:8000
     python -m app.cli ingest data/raw --show 5   # parse + chunk only, write data/processed/
 Add --offline to any command to run without Gemini (hash embeddings, extractive answers).
 """
@@ -81,7 +82,8 @@ def cmd_index(args: argparse.Namespace) -> int:
     try:
         print("Settings:", engine.settings.describe())
         t0 = time.perf_counter()
-        results = engine.index_directory(args.input)
+        # default: data/raw + data/uploads, minus deleted documents (same as the API's reindex)
+        results = engine.index_directory(args.input) if args.input else engine.reindex()
         _print_results(results)
         misses = getattr(engine.embedder, "last_misses", None)
         print(f"Indexed {engine.store.count()} chunks in {time.perf_counter() - t0:.1f}s"
@@ -127,7 +129,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
     try:
         if _need_index(engine):
             return 1
-        print("NexaCorp assistant - type a question, or 'exit' to quit.\n")
+        from .rag.conversation import Turn
+
+        print("NexaCorp assistant - type a question, 'new' to start over, or 'exit' to quit.\n")
+        history: list[Turn] = []
         while True:
             try:
                 q = input("you> ").strip()
@@ -138,8 +143,15 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 return 0
             if not q:
                 continue
+            if q.lower() in ("new", "reset"):
+                history = []
+                print("(new conversation)\n")
+                continue
             try:
-                print("\n" + engine.ask(q).format(show_sources=args.sources) + "\n")
+                a = engine.ask(q, history=history)
+                history = (history + [Turn(q, a.answer, a.standalone_question,
+                                           [c.filename for c in a.citations], a.abstained)])[-6:]
+                print("\n" + a.format(show_sources=args.sources) + "\n")
             except Exception as exc:
                 print(f"error: {exc}\n")
     finally:
@@ -178,6 +190,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    import uvicorn
+
+    if args.offline:
+        import os
+
+        os.environ.update({"LLM_PROVIDER": "offline", "EMBEDDING_PROVIDER": "hash",
+                           "INDEX_DIR": _settings(args).index_dir})
+    print(f"NexaCorp assistant on http://{args.host}:{args.port}  (API docs: /docs, stop with Ctrl+C)")
+    # one worker: local Qdrant locks its folder (set QDRANT_URL to run several workers)
+    uvicorn.run("app.api.server:app", host=args.host, port=args.port, workers=1, log_level="info")
+    return 0
+
+
 # ---------------------------------------------------------------- main
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -210,6 +236,12 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--sources", action="store_true", help="also show the retrieved chunks")
         p.add_argument("--offline", action="store_true")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("serve", help="run the web UI + REST API")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--offline", action="store_true")
+    p.set_defaults(func=cmd_serve)
 
     args = parser.parse_args(argv)
     return args.func(args)

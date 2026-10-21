@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexaCorp Assistant</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
+    --accent: #2f5d50; --accent-ink: #ffffff; --soft: #eef3f1;
+    --current: #2f7a4f; --reference: #3a5f8f; --superseded: #a06414; --draft: #7a7a7a; --danger: #b3261e;
+    --radius: 10px; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151614; --panel:#1e201d; --ink:#ecebe6; --muted:#a3a29c; --line:#30332e;
+            --accent:#7fb8a4; --accent-ink:#10201a; --soft:#22302b;
+            --current:#6cc191; --reference:#8db3e6; --superseded:#e0a54f; --draft:#a8a8a8; --danger:#f2867e; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  button, input, textarea { font: inherit; color: inherit; }
+  .app { display: grid; grid-template-columns: 330px 1fr; height: 100vh; }
+  aside { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .brand { padding: 18px 18px 12px; border-bottom: 1px solid var(--line); }
+  .brand h1 { font-size: 17px; margin: 0; letter-spacing: .2px; }
+  .brand p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  .section { padding: 14px 18px; border-bottom: 1px solid var(--line); }
+  .section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px;
+                display: flex; justify-content: space-between; align-items: center; }
+  .docs { overflow-y: auto; flex: 1; padding: 6px 10px 14px; }
+  .doc { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 8px; }
+  .doc:hover { background: var(--soft); }
+  .doc .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+  .doc .meta { color: var(--muted); font-size: 12px; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+  .s-current { color: var(--current); } .s-unspecified { color: var(--reference); }
+  .s-superseded { color: var(--superseded); } .s-draft { color: var(--draft); }
+  .icon-btn { border: 0; background: transparent; color: var(--muted); cursor: pointer; padding: 2px 6px; border-radius: 6px; }
+  .icon-btn:hover { color: var(--danger); background: var(--soft); }
+  .drop { border: 1.5px dashed var(--line); border-radius: var(--radius); padding: 14px; text-align: center; color: var(--muted);
+          font-size: 13px; cursor: pointer; transition: border-color .15s, background .15s; }
+  .drop.over, .drop:hover { border-color: var(--accent); background: var(--soft); color: var(--ink); }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .report { margin-top: 10px; font-size: 12.5px; }
+  .report div { padding: 3px 0; display: flex; gap: 6px; }
+  .a-created, .a-updated, .a-ok { color: var(--current); } .a-unchanged, .a-duplicate { color: var(--reference); }
+  .a-failed, .a-skipped, .a-rejected { color: var(--danger); }
+  details.settings summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+  details.settings input { width: 100%; margin-top: 6px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+
+  main { display: flex; flex-direction: column; min-height: 0; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; padding: 12px 24px; border-bottom: 1px solid var(--line); }
+  .topbar .status { color: var(--muted); font-size: 13px; }
+  .thread { flex: 1; overflow-y: auto; padding: 24px; }
+  .inner { max-width: 820px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 12vh; }
+  .empty h2 { color: var(--ink); font-size: 20px; margin-bottom: 6px; }
+  .examples { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
+  .examples button { border: 1px solid var(--line); background: var(--panel); border-radius: 99px; padding: 6px 13px; cursor: pointer; font-size: 13px; }
+  .examples button:hover { border-color: var(--accent); }
+  .msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); padding: 9px 14px; border-radius: 14px 14px 4px 14px; max-width: 80%; white-space: pre-wrap; }
+  .msg.bot { background: var(--panel); border: 1px solid var(--line); border-radius: 4px 14px 14px 14px; padding: 14px 16px; }
+  .msg.bot.abstained { border-style: dashed; }
+  .interp { color: var(--muted); font-size: 12.5px; font-style: italic; margin-bottom: 6px; }
+  .answer { white-space: pre-wrap; }
+  .cite-ref { font-size: 11.5px; vertical-align: super; color: var(--accent); cursor: pointer; font-weight: 600; padding: 0 1px; }
+  .cites { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+  .cite { border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+  .cite summary { cursor: pointer; padding: 6px 10px; display: flex; gap: 8px; align-items: center; list-style: none; }
+  .cite summary::-webkit-details-marker { display: none; }
+  .cite .lbl { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+  .cite .loc { color: var(--muted); }
+  .cite pre { margin: 0; padding: 8px 10px 10px; white-space: pre-wrap; font: 12.5px/1.45 var(--mono); color: var(--muted); border-top: 1px solid var(--line); }
+  .cite.flash { outline: 2px solid var(--accent); }
+  .foot { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }
+  .flag { border: 1px solid var(--superseded); color: var(--superseded); border-radius: 99px; padding: 0 7px; }
+  .typing { color: var(--muted); font-size: 13.5px; }
+  .typing::after { content: "…"; animation: blink 1s infinite; } @keyframes blink { 50% { opacity: .2 } }
+  .composer { border-top: 1px solid var(--line); padding: 14px 24px 18px; background: var(--bg); }
+  .composer form { max-width: 820px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; }
+  .composer textarea { flex: 1; resize: none; border: 1px solid var(--line); background: var(--panel); border-radius: 12px; padding: 10px 14px; min-height: 46px; max-height: 180px; }
+  .composer textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .error { color: var(--danger); }
+  .toggle-side { display: none; }
+
+  @media (max-width: 820px) {
+    .app { grid-template-columns: 1fr; }
+    aside { display: none; position: fixed; inset: 0; z-index: 10; }
+    aside.open { display: flex; }
+    .toggle-side { display: inline-block; }
+    .thread, .composer, .topbar { padding-left: 16px; padding-right: 16px; }
+    .msg.user { max-width: 92%; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside id="side">
+    <div class="brand">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h1>NexaCorp Assistant</h1>
+        <button class="btn toggle-side" onclick="side.classList.remove('open')">Close</button>
+      </div>
+      <p>Answers only from company documents, with sources.</p>
+    </div>
+    <div class="section">
+      <h2>Add documents</h2>
+      <label class="drop" id="drop">
+        Drop files here or click to choose<br>
+        <span style="font-size:12px">PDF, DOCX, XLSX, CSV, JSON, HTML, TXT, MD · max 20 MB</span>
+        <input id="file" type="file" multiple hidden>
+      </label>
+      <div class="row">
+        <button class="btn" id="reindex">Reindex all</button>
+        <span id="jobstate" class="doc meta" style="padding:6px 0"></span>
+      </div>
+      <div class="report" id="report"></div>
+      <details class="settings" style="margin-top:10px">
+        <summary>Admin token</summary>
+        <input id="token" type="password" placeholder="only needed if the server sets ADMIN_TOKEN" autocomplete="off">
+      </details>
+    </div>
+    <div class="section" style="border-bottom:0;padding-bottom:4px">
+      <h2><span>Documents <span id="doccount"></span></span><button class="icon-btn" title="Refresh" onclick="loadDocs()">↻</button></h2>
+    </div>
+    <div class="docs" id="docs"></div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <div style="display:flex;gap:10px;align-items:center">
+        <button class="btn toggle-side" onclick="side.classList.add('open')">Documents</button>
+        <span class="status" id="status">Connecting…</span>
+      </div>
+      <button class="btn" id="newchat">New chat</button>
+    </div>
+    <div class="thread" id="thread"><div class="inner" id="inner"></div></div>
+    <div class="composer">
+      <form id="form">
+        <textarea id="q" rows="1" placeholder="Ask about NexaCorp policies, projects, SLAs…" maxlength="2000"></textarea>
+        <button class="btn primary" id="send" type="submit">Ask</button>
+      </form>
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const side = $("side"), inner = $("inner"), thread = $("thread");
+let sessionId = null, busy = false;
+const EXAMPLES = [
+  "How many days per week can I work from home?",
+  "What is the total budget for Project Orion?",
+  "Did INC-102 meet its SLA?",
+  "And what was the WFH limit before?",
+];
+const STATUS_TEXT = { current: "current", unspecified: "reference", superseded: "superseded", draft: "draft" };
+
+// --- tiny DOM helper: text is always set with textContent (never innerHTML) so document text can't inject markup
+function el(tag, attrs = {}, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v);
+  }
+  for (const c of children.flat()) if (c != null) n.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  return n;
+}
+function getToken() { try { return localStorage.getItem("nx_token") || ""; } catch { return ""; } }
+$("token").value = getToken();
+$("token").addEventListener("change", (e) => { try { localStorage.setItem("nx_token", e.target.value); } catch {} });
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  const token = $("token").value.trim();
+  if (token) headers["X-Admin-Token"] = token;
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  let body = null; try { body = await res.json(); } catch {}
+  if (!res.ok && !(body && body.results)) {
+    const d = body && body.detail;
+    throw new Error(typeof d === "string" ? d : (d ? JSON.stringify(d) : `HTTP ${res.status}`));
+  }
+  return body;
+}
+
+// ---------------------------------------------------------------- chat
+function showEmpty() {
+  inner.replaceChildren(el("div", { class: "empty" },
+    el("h2", {}, "Ask a question about NexaCorp"),
+    el("div", {}, "Every answer cites the document and location it came from. Follow-up questions keep the context."),
+    el("div", { class: "examples" }, EXAMPLES.map((t) => el("button", { onclick: () => ask(t) }, t)))));
+}
+
+function renderAnswer(a) {
+  const box = el("div", { class: "msg bot" + (a.abstained ? " abstained" : "") });
+  if (a.standalone_question) box.append(el("div", { class: "interp" }, "Interpreted as: " + a.standalone_question));
+  const cites = new Map(a.citations.map((c) => [c.label, c]));
+  const textNode = el("div", { class: "answer" });
+  // turn [S1] markers into clickable superscripts
+  const parts = a.answer.split(/(\[S\d+\])/g);
+  for (const p of parts) {
+    const m = p.match(/^\[(S\d+)\]$/);
+    if (m && cites.has(m[1])) textNode.append(el("span", { class: "cite-ref", title: cites.get(m[1]).filename, onclick: () => openCite(box, m[1]) }, m[1]));
+    else textNode.append(p);
+  }
+  box.append(textNode);
+  if (a.citations.length) {
+    box.append(el("div", { class: "cites" }, a.citations.map((c) =>
+      el("details", { class: "cite", "data-label": c.label },
+        el("summary", {}, el("span", { class: "lbl" }, c.label), el("span", {}, c.filename),
+           el("span", { class: "loc" }, "· " + c.location), el("span", { class: "badge s-" + c.status }, STATUS_TEXT[c.status] || c.status)),
+        el("pre", {}, c.snippet)))));
+  }
+  const t = a.timings_ms || {};
+  box.append(el("div", { class: "foot" },
+    a.flags.map((f) => el("span", { class: "flag" }, f.replaceAll("_", " "))),
+    el("span", {}, `${a.abstained ? "no answer found" : a.confidence + " confidence"} · ${Math.round(t.total || 0)} ms` + (a.model ? ` · ${a.model}` : ""))));
+  return box;
+}
+function openCite(box, label) {
+  const d = box.querySelector(`details[data-label="${label}"]`);
+  if (!d) return;
+  d.open = true; d.classList.add("flash"); d.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  setTimeout(() => d.classList.remove("flash"), 900);
+}
+function scrollDown() { thread.scrollTop = thread.scrollHeight; }
+
+async function ask(question) {
+  question = question.trim();
+  if (!question || busy) return;
+  busy = true; $("send").disabled = true;
+  if (inner.querySelector(".empty")) inner.replaceChildren();
+  inner.append(el("div", { class: "msg user" }, question));
+  const wait = el("div", { class: "typing" }, "Searching the documents");
+  inner.append(wait); scrollDown();
+  try {
+    const a = await api("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+                                       body: JSON.stringify({ question, session_id: sessionId }) });
+    sessionId = a.session_id;
+    wait.replaceWith(renderAnswer(a));
+  } catch (e) {
+    wait.replaceWith(el("div", { class: "msg bot error" }, "Something went wrong: " + e.message));
+  } finally {
+    busy = false; $("send").disabled = false; scrollDown(); $("q").focus();
+  }
+}
+
+$("form").addEventListener("submit", (e) => { e.preventDefault(); const q = $("q").value; $("q").value = ""; autosize(); ask(q); });
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); } });
+function autosize() { const t = $("q"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 180) + "px"; }
+$("q").addEventListener("input", autosize);
+$("newchat").addEventListener("click", async () => {
+  if (sessionId) { try { await api("/api/chat/" + sessionId, { method: "DELETE" }); } catch {} }
+  sessionId = null; showEmpty(); $("q").focus();
+});
+
+// ---------------------------------------------------------------- documents
+async function loadDocs() {
+  try {
+    const { documents } = await api("/api/documents");
+    $("doccount").textContent = `(${documents.length})`;
+    $("docs").replaceChildren(...documents.map((d) => el("div", { class: "doc", title: d.superseded_by ? "replaced by " + d.superseded_by : d.title || d.filename },
+      el("div", { class: "name" }, d.filename, el("div", { class: "meta" }, `${d.chunks} chunk${d.chunks === 1 ? "" : "s"}${d.source === "upload" ? " · uploaded" : ""}${d.effective_date ? " · from " + d.effective_date : ""}`)),
+      el("span", { class: "badge s-" + d.status }, STATUS_TEXT[d.status] || d.status),
+      el("button", { class: "icon-btn", title: "Delete from index", onclick: () => removeDoc(d) }, "✕"))));
+    if (!documents.length) $("docs").append(el("div", { class: "doc meta" }, "No documents indexed yet."));
+  } catch (e) { $("docs").replaceChildren(el("div", { class: "doc error" }, e.message)); }
+}
+async function removeDoc(d) {
+  if (!confirm(`Delete ${d.filename} from the index? Answers will no longer use it.`)) return;
+  try { await api("/api/documents/" + encodeURIComponent(d.doc_id), { method: "DELETE" });
+        showReport([{ filename: d.filename, action: "deleted" }]); }
+  catch (e) { showReport([{ filename: d.filename, action: "failed", error: e.message }]); }
+  loadDocs(); loadStatus();
+}
+function showReport(results) {
+  $("report").replaceChildren(...results.map((r) => el("div", {},
+    el("span", { class: "a-" + (r.action === "deleted" ? "ok" : r.action) }, r.action), el("span", {}, r.filename),
+    r.error ? el("span", { class: "doc meta", style: "padding:0" }, "— " + r.error) : (r.n_chunks ? el("span", { class: "doc meta", style: "padding:0" }, `${r.n_chunks} chunks`) : null))));
+}
+async function upload(files) {
+  if (!files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f);
+  $("report").replaceChildren(el("div", { class: "typing" }, `Uploading ${files.length} file${files.length > 1 ? "s" : ""}`));
+  try { const job = await api("/api/documents", { method: "POST", body: fd }); showReport(job.results); }
+  catch (e) { $("report").replaceChildren(el("div", { class: "error" }, e.message)); }
+  $("file").value = ""; loadDocs(); loadStatus();
+}
+$("file").addEventListener("change", (e) => upload([...e.target.files]));
+const drop = $("drop");
+["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => upload([...e.dataTransfer.files]));
+
+$("reindex").addEventListener("click", async () => {
+  $("reindex").disabled = true; $("jobstate").textContent = "reindexing…";
+  try {
+    let job = await api("/api/reindex", { method: "POST" });
+    while (job.state === "running") { await new Promise((r) => setTimeout(r, 1000)); job = await api("/api/jobs/" + job.job_id); }
+    $("jobstate").textContent = job.state === "done" ? `done in ${job.seconds}s` : "failed: " + job.error;
+    const bad = job.results.filter((r) => r.action !== "ok");
+    showReport(bad.length ? bad : [{ filename: `${job.results.length} files`, action: "ok" }]);
+  } catch (e) { $("jobstate").textContent = e.message; }
+  $("reindex").disabled = false; loadDocs(); loadStatus();
+});
+
+async function loadStatus() {
+  try { const h = await api("/health");
+        $("status").textContent = `${h.documents} documents · ${h.chunks} chunks · ${h.llm === "gemini" ? "Gemini" : "offline mode"}`; }
+  catch { $("status").textContent = "Server not reachable"; }
+}
+
+showEmpty(); loadDocs(); loadStatus(); $("q").focus();
+</script>
+</body>
+</html>

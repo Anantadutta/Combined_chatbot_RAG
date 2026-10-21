@@ -5,7 +5,7 @@ It answers questions only from company documents, cites the exact file and locat
 prefers current documents over superseded and draft ones, and says so when the answer
 isn't in the documents.
 
-> **Status:** Steps 1-3 of 6 complete - ingestion, hybrid retrieval, reranking, cited Gemini answers, and guardrails (document authority, abstention, prompt-injection defence).
+> **Status:** Steps 1-5 of 6 complete - ingestion, hybrid retrieval, reranking, cited Gemini answers, guardrails, a FastAPI backend with a web chat/upload UI, multi-turn chat, and document upload/update/delete/reindex.
 
 ## Roadmap
 
@@ -14,8 +14,8 @@ isn't in the documents.
 | 1 | Parse 8 file types, detect document status, structure-aware chunking | ✅ done |
 | 2 | Embeddings, vector DB, hybrid (BM25 + vector) retrieval, reranking, answers with citations | ✅ done |
 | 3 | Current/superseded/draft handling, no-answer abstention, prompt-injection defence | ✅ done |
-| 4 | FastAPI backend + chat/upload UI, multi-turn chat | ⏳ |
-| 5 | Upload / update / delete / reindex, deduplication, ingestion status | ⏳ |
+| 4 | FastAPI backend + chat/upload UI, multi-turn chat | ✅ done |
+| 5 | Upload / update / delete / reindex, deduplication, ingestion status | ✅ done |
 | 6 | Evaluation harness, Docker, cloud deployment, architecture diagram | ⏳ |
 
 ## Quick start
@@ -31,7 +31,8 @@ cp .env.example .env               # Windows: Copy-Item .env.example .env
 python -m app.cli check            # verifies the key, embedding model and chat model
 python -m app.cli index            # parse, chunk, embed and store data/raw in Qdrant
 python -m app.cli ask "How many days per week can I work from home?" --sources
-python -m app.cli chat             # ask questions in a loop
+python -m app.cli chat             # multi-turn chat in the terminal
+python -m app.cli serve            # web UI + API on http://127.0.0.1:8000 (API docs at /docs)
 python -m pytest -q                # run the tests (no API key or network needed)
 ```
 
@@ -162,6 +163,67 @@ or same category with an effective date equal to the old document's "superseded 
 
 Every answer carries `flags` (shown by `ask`/`chat` and in `--json`), so reviewers can see which guard fired.
 
+## Web UI and REST API (`app/api/server.py`)
+
+`python -m app.cli serve` starts the web app (chat on the right, documents + upload on the left)
+and the JSON API. Interactive API docs: http://127.0.0.1:8000/docs
+
+| Method | Path | What |
+|---|---|---|
+| GET | `/health` | liveness, number of documents and chunks |
+| GET | `/api/stats` | settings, documents by status |
+| POST | `/api/ask` | one question, no memory: `{"question": "...", "filters": {"status": ["current"]}, "top_k": 6}` |
+| POST | `/api/chat` | multi-turn: `{"question": "...", "session_id": "..."}` (omit `session_id` to start) |
+| GET / DELETE | `/api/chat/{session_id}` | show / forget a conversation |
+| GET | `/api/documents`, `/api/documents/{doc_id}` | indexed documents: status, chunks, effective date, replaced-by |
+| POST | `/api/documents` | upload files (multipart field `files`, up to 20 per request) |
+| PUT | `/api/documents/{doc_id}` | replace a document with a new version (multipart field `file`) |
+| DELETE | `/api/documents/{doc_id}` | remove a document from the index |
+| POST | `/api/reindex` | rebuild the index in the background (`?wait=true` to block) |
+| GET | `/api/jobs`, `/api/jobs/{job_id}` | ingestion status of uploads and reindex runs |
+
+Every answer contains `answer`, `abstained`, `confidence`, `citations` (file, location, status,
+snippet), `retrieved`, `flags`, `timings_ms` (rewrite / retrieve / rerank / generate / total), `model`
+and, for chat follow-ups, `standalone_question`.
+
+```bash
+curl -s localhost:8000/api/chat -H "content-type: application/json" -d '{"question": "How many WFH days?"}'
+curl -s localhost:8000/api/documents -F "files=@new_policy.pdf"
+curl -s -X DELETE localhost:8000/api/documents/conflicting-draft-txt
+```
+
+**Multi-turn chat.** A follow-up ("what about the previous policy?", "who approved it?") is rewritten
+into a standalone question before retrieval, using the last 6 turns: by Gemini (a small JSON-only
+rewrite prompt that treats the conversation as untrusted data) or, offline / on error, by appending
+the previous question as search context. The conversation is also given to the answer prompt, but
+facts must still come from the cited sources. Questions that name their own subject ("Did INC-102
+meet its SLA?") are not rewritten. Sessions are kept in memory (6 turns, 2 h idle, 1000 sessions).
+
+**Document library.** The index is built from `data/raw` (the corpus) plus `data/uploads` (files
+added through the API/UI; an upload overrides a corpus file of the same name).
+
+| Upload result | Meaning |
+|---|---|
+| `created` | new document, parsed and indexed |
+| `updated` | same file name, new content: old chunks replaced (a policy change takes effect at once) |
+| `unchanged` | same name and same bytes: nothing to do |
+| `duplicate` | same bytes as another document already indexed: not indexed twice |
+| `failed` | malformed, empty or too large (> 20 MB): reported with the reason, index untouched |
+| `skipped` | unsupported file type |
+
+Deleting a document removes its chunks immediately; deleting a corpus file also records it in
+`data/index/deleted.json` so a reindex doesn't bring it back (uploading it again restores it).
+Reindexing reuses cached embeddings, so it costs no API calls for unchanged text.
+
+**Concurrency.** Requests are served from a thread pool. Writes (upload/update/delete/reindex)
+take one lock, so they never interleave; questions don't take that lock, and see either the old
+or the new index, never a half-written one. Local Qdrant locks its folder, so run **one**
+server process; for several processes or machines set `QDRANT_URL` (Qdrant server / Qdrant Cloud).
+
+**Security.** Set `ADMIN_TOKEN` to require the header `X-Admin-Token` on upload/update/delete/
+reindex (the UI has a field for it). Uploaded file names are reduced to their base name, the UI
+renders all document text as plain text, and errors never return stack traces.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -188,14 +250,20 @@ app/
     reranker.py           local and Gemini rerankers
   rag/
     prompts.py            system prompt and source formatting
-    engine.py             index / retrieve / rerank / generate / validate citations
+    guardrails.py         authority policy, injection defence, grounding checks
+    conversation.py       chat sessions + follow-up question rewriting
+    engine.py             index / retrieve / rerank / generate / validate citations, document library
+  api/
+    server.py             FastAPI app (chat, ask, documents, reindex, jobs)
+    static/index.html     web chat + upload UI
   ingestion/
     models.py             Section, ParsedDocument, Chunk
     parsers.py            one parser per format
     metadata.py           status, dates, category, entity ids, injection flag
     chunker.py            structure-aware chunking
     pipeline.py           validate -> parse -> chunk, per-file result
-data/index/                vector DB + embedding cache (created by `index`, not committed)
+data/index/               vector DB + embedding cache (created by `index`, not committed)
+data/uploads/             files added through the API / UI (not committed)
 data/raw/                 the NexaCorp source documents
 tests/                    unit + integration tests (pytest)
 ```

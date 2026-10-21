@@ -29,6 +29,7 @@ class Settings:
     reranker: str = "local"  # "local" | "gemini" | "none"
 
     data_dir: str = str(ROOT / "data" / "raw")
+    uploads_dir: str = str(ROOT / "data" / "uploads")  # files added through the API / UI
     index_dir: str = str(ROOT / "data" / "index")
     qdrant_path: str | None = None  # local folder; ":memory:" for tests; default <index_dir>/qdrant
     qdrant_url: str | None = None  # set to use Qdrant Cloud / a Qdrant server instead
@@ -40,6 +41,8 @@ class Settings:
     temperature: float = 0.1
     request_timeout_s: int = 60
     max_retries: int = 4
+    admin_token: str | None = None  # if set, upload/delete/reindex need header X-Admin-Token
+    rewrite_follow_ups: bool = True  # rewrite follow-up chat questions into standalone ones
 
     @property
     def resolved_qdrant_path(self) -> str:
@@ -80,6 +83,7 @@ def load_settings(env_file: str | Path | None = None, **overrides) -> Settings:
         embedding_dim=int(_env("EMBEDDING_DIM", str(Settings.embedding_dim))),
         reranker=_env("RERANKER", Settings.reranker).lower(),
         data_dir=_env("DATA_DIR", Settings.data_dir),
+        uploads_dir=_env("UPLOADS_DIR", Settings.uploads_dir),
         index_dir=_env("INDEX_DIR", Settings.index_dir),
         qdrant_path=_env("QDRANT_PATH"),
         qdrant_url=_env("QDRANT_URL"),
@@ -88,6 +92,8 @@ def load_settings(env_file: str | Path | None = None, **overrides) -> Settings:
         candidate_k=int(_env("CANDIDATE_K", str(Settings.candidate_k))),
         top_k=int(_env("TOP_K", str(Settings.top_k))),
         temperature=float(_env("LLM_TEMPERATURE", str(Settings.temperature))),
+        admin_token=_env("ADMIN_TOKEN"),
+        rewrite_follow_ups=_env("REWRITE_FOLLOW_UPS", "true").lower() not in ("0", "false", "no"),
     )
     if overrides:
         settings = settings.with_overrides(**overrides)

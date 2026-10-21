@@ -7,7 +7,7 @@ isn't in the documents.
 
 > **Status:** all 6 steps built - ingestion, hybrid retrieval, reranking, cited Gemini answers, guardrails, a FastAPI backend with a web chat/upload UI, multi-turn chat, document upload/update/delete/reindex, a batch evaluation harness, Docker and a Render deployment blueprint.
 >
-> **Live demo:** _(add the Render URL here after deploying)_
+> **Live demo:** https://nexacorp-rag.onrender.com
 
 ## Roadmap
 

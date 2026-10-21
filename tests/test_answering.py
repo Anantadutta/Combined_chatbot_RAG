@@ -51,11 +51,14 @@ def test_prompt_labels_status_and_numbers_sources():
                              "text": "WFH 2 days", "effective_date": "2026-04-01"})
     old = Candidate("y::0", {"filename": "HR_Policy_2025_Superseded.pdf", "location": "page 1",
                              "status": "superseded", "text": "WFH 3 days"})
-    prompt = build_prompt("How many WFH days?", [("S1", cur), ("S2", old)], "2026-10-20")
+    old.payload["doc_id"] = "y"
+    links = {"y": {"by": "HR_Policy_2026_Current.pdf", "date": "2026-04-01"}}
+    prompt = build_prompt("How many WFH days?", [("S1", cur), ("S2", old)], "2026-10-20", links)
+    assert '<source id="S1">' in prompt
     assert "[S1] file: HR_Policy_2026_Current.pdf | location: page 1 | status: CURRENT - authoritative" in prompt
-    assert "SUPERSEDED - no longer in force" in prompt
-    assert prompt.strip().endswith("QUESTION: How many WFH days?")
-    assert "untrusted data" in SYSTEM_PROMPT
+    assert "SUPERSEDED - no longer in force (replaced by HR_Policy_2026_Current.pdf on 2026-04-01)" in prompt
+    assert prompt.strip().endswith("<question>\nHow many WFH days?\n</question>")
+    assert "untrusted input" in SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------- end-to-end with fake LLM
@@ -73,12 +76,13 @@ def test_answer_citations_map_to_real_sources(raw_dir):
     e.close()
 
 
-def test_hallucinated_citation_removed_and_confidence_lowered(raw_dir):
+def test_hallucinated_citation_makes_answer_an_abstention(raw_dir):
     reply = json.dumps({"answer": "It is 5 days [S99].", "citations": ["S99"], "abstained": False,
                         "confidence": "high"})
     e = engine_with(raw_dir, reply)
     a = e.ask("How many days can I work from home?")
-    assert a.citations == [] and "[S99]" not in a.answer and a.confidence == "low"
+    assert a.citations == [] and "5 days" not in a.answer and a.abstained
+    assert "ungrounded_answer_suppressed" in a.flags
     e.close()
 
 
@@ -222,4 +226,16 @@ def test_engine_degrades_gracefully_when_llm_fails(raw_dir):
     e.index_directory(raw_dir)
     a = e.ask("What is the API rate limit?")
     assert "unavailable" in a.answer and "120 requests" in a.answer and a.model == "unavailable-fallback"
+    e.close()
+
+
+def test_reasoning_is_kept_out_of_the_answer(raw_dir):
+    reply = json.dumps({"reasoning": "10:27 - 10:00 = 27 min > 20 min SLA; also > 15 min internal.",
+                        "answer": "No - INC-102 took 27 minutes, over its 20-minute SLA [S1].",
+                        "citations": ["S1"], "abstained": False, "confidence": "high"})
+    e = engine_with(raw_dir, reply)
+    a = e.ask("Was INC-102 acknowledged within its SLA?")
+    assert "27 min > 20" not in a.answer and "27 min > 20" in a.reasoning
+    assert "27 min > 20" not in a.format()
+    assert '"reasoning"' in SYSTEM_PROMPT
     e.close()

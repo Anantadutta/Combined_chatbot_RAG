@@ -17,12 +17,16 @@ from ..retrieval import (CachedEmbedder, GeminiEmbedder, GeminiReranker, HashEmb
                          LocalReranker, NoReranker, VectorStore)
 from ..retrieval.hybrid import Candidate
 from ..retrieval.text import tokenize
+from .guardrails import (Intent, answer_flags, apply_authority_policy, build_supersession_links, detect_intent,
+                         leaks_system_prompt)
 from .prompts import SYSTEM_PROMPT, build_prompt
 
 log = logging.getLogger(__name__)
 
 MAX_QUESTION_CHARS = 2000
 NO_ANSWER = "I could not find this in the NexaCorp documents."
+REFUSAL = "I can only answer questions about NexaCorp documents, and I can't share my internal instructions."
+NON_AUTHORITATIVE_NOTE = "Note: this is based only on a superseded or draft document, which is not in force. "
 CITATION = re.compile(r"\[(S\d+)\]")
 
 
@@ -46,13 +50,16 @@ class Answer:
     retrieved: list[dict] = field(default_factory=list)
     timings_ms: dict[str, float] = field(default_factory=dict)
     model: str | None = None
-    reasoning: str | None = None  # model scratchpad, never shown in the answer
+    flags: list[str] = field(default_factory=list)
+    reasoning: str | None = None  # model scratchpad: kept for debugging (--json), never shown in the answer
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     def format(self, show_sources: bool = False) -> str:
         lines = [self.answer, ""]
+        if self.flags:
+            lines.insert(1, f"[flags: {', '.join(self.flags)}]")
         for c in self.citations:
             lines.append(f"  [{c.label}] {c.filename} - {c.location} ({c.status})")
         if show_sources:
@@ -151,13 +158,27 @@ class RAGEngine:
                 **self.settings.describe()}
 
     # ------------------------------------------------------------------ answering
-    def retrieve(self, question: str, filters: dict | None = None, top_k: int | None = None) -> tuple[list[Candidate], dict]:
+    def retrieve(self, question: str, filters: dict | None = None, top_k: int | None = None,
+                 intent: Intent | None = None) -> tuple[list[Candidate], dict]:
+        """Hybrid search -> rerank all candidates -> authority policy -> top_k sources."""
+        intent = intent or detect_intent(question)
+        if filters and any(k in filters for k in ("status", "filename", "doc_id")):
+            # the caller explicitly chose which documents to search: respect that choice
+            intent = Intent(historical=True, drafts=True, injection=intent.injection)
         t0 = time.perf_counter()
         candidates = self.retriever.search(question, self.settings.candidate_k, filters)
         t1 = time.perf_counter()
-        top = self.reranker.rerank(question, candidates, top_k or self.settings.top_k)
+        ranked = self.reranker.rerank(question, candidates, len(candidates))
+        policy = apply_authority_policy(ranked, intent, top_k or self.settings.top_k)
         t2 = time.perf_counter()
-        return top, {"retrieve": (t1 - t0) * 1000, "rerank": (t2 - t1) * 1000}
+        return policy.sources, {"retrieve": (t1 - t0) * 1000, "rerank": (t2 - t1) * 1000}
+
+    def supersession_links(self) -> dict[str, dict]:
+        payloads = self.retriever.payloads
+        if getattr(self, "_links_for", None) is not payloads:  # recompute after every (re)index
+            self._links = build_supersession_links(list(payloads.values()))
+            self._links_for = payloads
+        return self._links
 
     def ask(self, question: str, filters: dict | None = None, top_k: int | None = None) -> Answer:
         start = time.perf_counter()
@@ -167,7 +188,8 @@ class RAGEngine:
         if len(question) > MAX_QUESTION_CHARS:
             raise ValueError(f"question is longer than {MAX_QUESTION_CHARS} characters")
 
-        top, timings = self.retrieve(question, filters, top_k)
+        intent = detect_intent(question)
+        top, timings = self.retrieve(question, filters, top_k, intent)
         sources = [(f"S{i}", c) for i, c in enumerate(top, start=1)]
 
         t_gen = time.perf_counter()
@@ -178,8 +200,9 @@ class RAGEngine:
             data = self._extractive_answer(question, sources)
         else:
             try:
-                raw = self.llm.generate(SYSTEM_PROMPT, build_prompt(question, sources, dt.date.today().isoformat()),
-                                        temperature=self.settings.temperature)
+                prompt = build_prompt(question, sources, dt.date.today().isoformat(), self.supersession_links(),
+                                      injection_suspected=intent.injection)
+                raw = self.llm.generate(SYSTEM_PROMPT, prompt, temperature=self.settings.temperature)
                 data = parse_llm_json(raw)
                 model = getattr(self.llm, "last_model_used", None)
             except Exception as exc:  # Gemini down / quota exhausted: degrade instead of crashing
@@ -191,14 +214,17 @@ class RAGEngine:
                 model = "unavailable-fallback"
         timings["generate"] = (time.perf_counter() - t_gen) * 1000
 
-        answer = self._finalise(question, data, sources)
+        answer = self._finalise(question, data, sources, intent)
         answer.model = model
         timings["total"] = (time.perf_counter() - start) * 1000
         answer.timings_ms = {k: round(v, 1) for k, v in timings.items()}
         return answer
 
-    def _finalise(self, question: str, data: dict, sources: list[tuple[str, Candidate]]) -> Answer:
+    def _finalise(self, question: str, data: dict, sources: list[tuple[str, Candidate]],
+                  intent: Intent | None = None) -> Answer:
+        intent = intent or Intent()
         by_label = {label: c for label, c in sources}
+        flags: list[str] = []
         text = str(data.get("answer") or "").strip()
         abstained = bool(data.get("abstained")) or not text
         # citations = those listed + those used inline, keeping only labels that really exist
@@ -210,16 +236,37 @@ class RAGEngine:
         confidence = str(data.get("confidence") or "medium").lower()
         if confidence not in ("high", "medium", "low"):
             confidence = "medium"
-        if not abstained and not valid:
-            confidence = "low"  # an answer with no valid citation is not grounded
+        reasoning = str(data.get("reasoning") or "").strip() or None
+
+        if intent.injection:
+            flags.append("injection_attempt_in_question")
+        if any(c.payload.get("contains_injection") for c in by_label.values()):
+            flags.append("injection_text_in_sources")
+
+        if leaks_system_prompt(text):  # output guard: never reveal the hidden instructions
+            flags.append("blocked_prompt_leak")
+            text, valid, abstained, confidence, reasoning = REFUSAL, [], True, "high", None
+        elif not abstained and not valid:
+            # grounding guard: an answer that cites nothing is not shown as fact
+            flags.append("ungrounded_answer_suppressed")
+            text, abstained, confidence = NO_ANSWER, True, "low"
+        elif abstained:
+            valid = [l for l in valid if l in CITATION.findall(text)]  # keep citations only if used in the text
+
+        statuses = [by_label[l].payload.get("status") for l in valid]
+        extra = answer_flags(statuses, intent) if not abstained else []
+        if "relies_on_non_authoritative" in extra:
+            text, confidence = NON_AUTHORITATIVE_NOTE + text, "low"
+        flags += extra
+
         citations = [
             Citation(l, by_label[l].payload["filename"], by_label[l].payload["location"],
                      by_label[l].payload["status"], by_label[l].chunk_id, by_label[l].payload["text"][:300])
             for l in valid
         ]
         return Answer(question=question, answer=text or NO_ANSWER, abstained=abstained, confidence=confidence,
-                      citations=citations, retrieved=[c.brief() for _, c in sources],
-                      reasoning=str(data.get('reasoning') or '').strip() or None)
+                      citations=citations, retrieved=[c.brief() for _, c in sources], flags=flags,
+                      reasoning=reasoning)
 
     def _extractive_answer(self, question: str, sources: list[tuple[str, Candidate]]) -> dict:
         """Offline mode (no LLM): return the best authoritative passage verbatim, or abstain."""

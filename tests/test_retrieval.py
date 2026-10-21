@@ -89,11 +89,19 @@ def test_metadata_filter_excludes_non_authoritative(engine):
     assert {c.payload["filename"] for c in top} == {"Conflicting_Draft.txt"}
 
 
-def test_current_policy_outranks_superseded_and_draft(engine):
+def test_current_policy_outranks_superseded_and_draft_is_excluded(engine):
     top, _ = engine.retrieve("work from home allowance")
     order = [c.payload["filename"] for c in top]
-    assert order.index("HR_Policy_2026_Current.pdf") < order.index("HR_Policy_2025_Superseded.pdf")
-    assert order.index("HR_Policy_2026_Current.pdf") < order.index("Conflicting_Draft.txt")
+    assert order[0] == "HR_Policy_2026_Current.pdf"
+    assert order[-1] == "HR_Policy_2025_Superseded.pdf"  # kept only as trailing background
+    assert "Conflicting_Draft.txt" not in order
+
+
+def test_draft_and_history_questions_keep_those_documents(engine):
+    drafts = [c.payload["filename"] for c in engine.retrieve("Is there a draft proposal to change WFH days?")[0]]
+    assert "Conflicting_Draft.txt" in drafts
+    history = [c.payload["filename"] for c in engine.retrieve("What was the previous work from home policy?")[0]]
+    assert "HR_Policy_2025_Superseded.pdf" in history and "Conflicting_Draft.txt" not in history
 
 
 def test_reranker_entity_boost():

@@ -110,6 +110,7 @@ def chunk_document(
                 "status": doc_meta["status"],
                 "authoritative": doc_meta["authoritative"],
                 "effective_date": doc_meta["effective_date"],
+                "superseded_date": doc_meta.get("superseded_date"),
                 "version": doc_meta["version"],
                 "doc_sha256": doc_meta["sha256"],
                 # chunk-level

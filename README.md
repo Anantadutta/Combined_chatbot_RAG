@@ -5,14 +5,14 @@ It answers questions only from company documents, cites the exact file and locat
 prefers current documents over superseded and draft ones, and says so when the answer
 isn't in the documents.
 
-> **Status:** Step 1 of 6 complete - document ingestion (parsing + chunking).
+> **Status:** Steps 1-2 of 6 complete - ingestion, hybrid retrieval, reranking and cited answers with Gemini.
 
 ## Roadmap
 
 | Step | What | Status |
 |---|---|---|
 | 1 | Parse 8 file types, detect document status, structure-aware chunking | ✅ done |
-| 2 | Embeddings, vector DB, hybrid (BM25 + vector) retrieval, reranking, answers with citations | ⏳ |
+| 2 | Embeddings, vector DB, hybrid (BM25 + vector) retrieval, reranking, answers with citations | ✅ done |
 | 3 | Current/superseded/draft handling, no-answer abstention, prompt-injection defence | ⏳ |
 | 4 | FastAPI backend + chat/upload UI, multi-turn chat | ⏳ |
 | 5 | Upload / update / delete / reindex, deduplication, ingestion status | ⏳ |
@@ -25,15 +25,27 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-python -m app.cli ingest data/raw --show 5   # parse + chunk all documents
-python -m pytest -q                          # run the tests
+cp .env.example .env               # Windows: Copy-Item .env.example .env
+# edit .env and set GEMINI_API_KEY=...
+
+python -m app.cli check            # verifies the key, embedding model and chat model
+python -m app.cli index            # parse, chunk, embed and store data/raw in Qdrant
+python -m app.cli ask "How many days per week can I work from home?" --sources
+python -m app.cli chat             # ask questions in a loop
+python -m pytest -q                # run the tests (no API key or network needed)
 ```
 
-Ingestion writes to `data/processed/`:
+No API key? Add `--offline` to `index`, `ask` and `chat`. Offline mode uses hash embeddings
+and returns the best matching passage verbatim instead of a generated answer.
 
-- `chunks.jsonl` - one chunk per line: `chunk_id`, `text`, `embed_text`, `metadata`
-- `documents.json` - document-level metadata (status, effective date, category, sha256...)
-- `ingestion_report.json` - per-file result: `ok` / `failed` / `skipped` / `duplicate`, timing, error
+Other commands:
+
+```bash
+python -m app.cli ask "..." --json                      # full answer object: citations, retrieved chunks, timings
+python -m app.cli ask "..." --status current unspecified  # metadata filter
+python -m app.cli ask "..." --category policy             # metadata filter
+python -m app.cli ingest data/raw --show 5              # parse + chunk only, write data/processed/
+```
 
 ## How ingestion works
 
@@ -91,17 +103,66 @@ Corrupt, empty, binary, oversized (>20 MB) or unsupported files are reported in 
 report and never crash a batch. Identical content uploaded under a different name is marked
 `duplicate`. Uploaded filenames are stripped of directory parts.
 
+## How question answering works
+
+```
+question ─► embed query ─► Qdrant (dense, top 20) ─┐
+        └─► BM25 keyword index (top 20) ───────────┴─► Reciprocal Rank Fusion ─► rerank ─► top 6
+                                                                                            │
+           answer + [S#] citations ◄── validate citations ◄── Gemini (JSON) ◄── prompt ◄────┘
+```
+
+| Stage | Implementation | Why |
+|---|---|---|
+| Embeddings | `gemini-embedding-001`, 768 dims, `RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY` task types, L2-normalised | separate document/query task types improve retrieval |
+| Embedding cache | disk cache keyed by sha1(model + text) | re-indexing unchanged chunks makes no API calls |
+| Vector DB | Qdrant: local folder by default, `QDRANT_URL` for a server/Qdrant Cloud | metadata filtering, same code locally and in the cloud |
+| Keyword search | BM25 written from scratch (`app/retrieval/bm25.py`) | exact ids such as `INC-102`, `OR-101` and numbers that embeddings blur |
+| Fusion | Reciprocal Rank Fusion, k = 60 | combines ranks, so no score calibration is needed |
+| Reranking | local: 0.45·fusion + 0.35·query-term coverage + 0.20·entity-id match + authority prior; optional `RERANKER=gemini` (LLM grades all candidates in one call) | puts the passage that actually contains the asked-about entity first |
+| Metadata filters | `status`, `category`, `filename`, `doc_id`, `entity_ids`, applied to both retrievers | e.g. only authoritative documents |
+| Generation | `gemini-3.8-flash` (fallback `gemini-3.5-flash-lite`), temperature 0.1, JSON output | structured `answer / citations / abstained / confidence` |
+| Grounding checks | citations must refer to retrieved sources; invented `[S#]` labels are removed; an uncited answer is marked low confidence | no unsupported citations |
+| Resilience | retries 429/5xx/timeouts with exponential backoff (honours "retry in Ns"); falls back to the second model | the free tier has per-minute limits |
+
+The prompt labels every source CURRENT / REFERENCE / SUPERSEDED / DRAFT, and tells the model
+that source text is untrusted data. API calls per question: 1 query embedding + 1 generation
+(+1 with `RERANKER=gemini`).
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `check` says API key not valid | create a new key at aistudio.google.com/apikey and put it in `.env` as `GEMINI_API_KEY=...` (no quotes) |
+| `429` / resource exhausted | free-tier rate limit; the client waits and retries automatically, or wait a minute |
+| `404` model not found | set `GEMINI_MODEL` in `.env` to a model listed at ai.google.dev/gemini-api/docs/models |
+| `Storage folder ... is already accessed by another instance` | only one process can open the local Qdrant folder; close the other `chat`/`ask` window |
+| Changed the embedding model or dimension | run `python -m app.cli index` again (the collection is rebuilt automatically) |
+
 ## Project layout
 
 ```
 app/
   cli.py                  command line (python -m app.cli ...)
+  config.py               settings from .env
+  llm/gemini.py           Gemini client: embeddings, generation, retries, fallback model
+  retrieval/
+    text.py               tokeniser (stemming, ids, abbreviations)
+    embeddings.py         Gemini / offline hash embedder + disk cache
+    vector_store.py       Qdrant wrapper with metadata filters
+    bm25.py               BM25 keyword index
+    hybrid.py             dense + BM25 with Reciprocal Rank Fusion
+    reranker.py           local and Gemini rerankers
+  rag/
+    prompts.py            system prompt and source formatting
+    engine.py             index / retrieve / rerank / generate / validate citations
   ingestion/
     models.py             Section, ParsedDocument, Chunk
     parsers.py            one parser per format
     metadata.py           status, dates, category, entity ids, injection flag
     chunker.py            structure-aware chunking
     pipeline.py           validate -> parse -> chunk, per-file result
+data/index/                vector DB + embedding cache (created by `index`, not committed)
 data/raw/                 the NexaCorp source documents
 tests/                    unit + integration tests (pytest)
 ```

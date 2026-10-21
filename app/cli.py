@@ -1,18 +1,41 @@
 """Command-line entry point.
 
-    python -m app.cli ingest data/raw            # parse + chunk every file, write data/processed/
-    python -m app.cli ingest data/raw --show 5   # also print the first 5 chunks
+    python -m app.cli check                      # test the Gemini key and models
+    python -m app.cli index                      # parse, chunk, embed and store data/raw
+    python -m app.cli ask "How many WFH days?"   # one question -> cited answer
+    python -m app.cli chat                       # ask questions in a loop
+    python -m app.cli ingest data/raw --show 5   # parse + chunk only, write data/processed/
+Add --offline to any command to run without Gemini (hash embeddings, extractive answers).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+import time
 from pathlib import Path
 
 from .ingestion import ingest_directory
 
 
+def _settings(args: argparse.Namespace):
+    from .config import load_settings
+
+    overrides = {}
+    if getattr(args, "offline", False):
+        overrides = {"llm_provider": "offline", "embedding_provider": "hash", "reranker": "local",
+                     "index_dir": str(Path(load_settings(llm_provider="offline", embedding_provider="hash").index_dir) / "offline")}
+    return load_settings(**overrides)
+
+
+def _engine(args: argparse.Namespace):
+    from .rag import RAGEngine
+
+    return RAGEngine(_settings(args))
+
+
+# ---------------------------------------------------------------- ingest (step 1)
 def cmd_ingest(args: argparse.Namespace) -> int:
     results = ingest_directory(args.input, max_chars=args.max_chars)
     out = Path(args.output)
@@ -29,12 +52,8 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     (out / "ingestion_report.json").write_text(
         json.dumps([r.summary() for r in results], indent=2), encoding="utf-8"
     )
-
-    print(f"{'FILE':34} {'RESULT':9} {'DOC STATUS':12} {'CHUNKS':>6}  NOTE")
-    for r in results:
-        print(f"{r.filename:34} {r.status:9} {r.document.get('status', '-'):12} {r.n_chunks:>6}  {r.error or ''}")
-    total = sum(r.n_chunks for r in ok)
-    print(f"\n{len(ok)}/{len(results)} files ingested, {total} chunks -> {out}/chunks.jsonl")
+    _print_results(results)
+    print(f"-> {out}/chunks.jsonl")
 
     if args.show:
         print()
@@ -48,16 +67,149 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0 if all(r.status in ("ok", "duplicate", "skipped") for r in results) else 1
 
 
+def _print_results(results) -> None:
+    print(f"{'FILE':34} {'RESULT':9} {'DOC STATUS':12} {'CHUNKS':>6}  NOTE")
+    for r in results:
+        print(f"{r.filename:34} {r.status:9} {r.document.get('status', '-'):12} {r.n_chunks:>6}  {r.error or ''}")
+    ok = [r for r in results if r.status == "ok"]
+    print(f"\n{len(ok)}/{len(results)} files ingested, {sum(r.n_chunks for r in ok)} chunks")
+
+
+# ---------------------------------------------------------------- step 2 commands
+def cmd_index(args: argparse.Namespace) -> int:
+    engine = _engine(args)
+    try:
+        print("Settings:", engine.settings.describe())
+        t0 = time.perf_counter()
+        results = engine.index_directory(args.input)
+        _print_results(results)
+        misses = getattr(engine.embedder, "last_misses", None)
+        print(f"Indexed {engine.store.count()} chunks in {time.perf_counter() - t0:.1f}s"
+              + (f" ({misses} new embeddings, rest from cache)" if misses is not None else ""))
+        return 0
+    finally:
+        engine.close()
+
+
+def _need_index(engine) -> bool:
+    if engine.store.count() == 0:
+        print("The index is empty - run:  python -m app.cli index" + (" --offline" if engine.llm is None else ""))
+        return True
+    return False
+
+
+def _filters(args: argparse.Namespace) -> dict | None:
+    filters = {}
+    if getattr(args, "status", None):
+        filters["status"] = args.status
+    if getattr(args, "category", None):
+        filters["category"] = args.category
+    if getattr(args, "file", None):
+        filters["filename"] = args.file
+    return filters or None
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    engine = _engine(args)
+    try:
+        if _need_index(engine):
+            return 1
+        answer = engine.ask(" ".join(args.question), filters=_filters(args))
+        print(json.dumps(answer.to_dict(), indent=2, ensure_ascii=False) if args.json
+              else answer.format(show_sources=args.sources))
+        return 0
+    finally:
+        engine.close()
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    engine = _engine(args)
+    try:
+        if _need_index(engine):
+            return 1
+        print("NexaCorp assistant - type a question, or 'exit' to quit.\n")
+        while True:
+            try:
+                q = input("you> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            if q.lower() in ("exit", "quit", ":q"):
+                return 0
+            if not q:
+                continue
+            try:
+                print("\n" + engine.ask(q).format(show_sources=args.sources) + "\n")
+            except Exception as exc:
+                print(f"error: {exc}\n")
+    finally:
+        engine.close()
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Smoke-test the configuration: key present, embedding works, generation works."""
+    from .config import load_settings
+    from .llm import GeminiClient
+
+    try:
+        s = load_settings()
+    except ValueError as exc:
+        print(f"[FAIL] {exc}")
+        return 1
+    print("Settings:", s.describe())
+    if not s.gemini_api_key:
+        print("[FAIL] No GEMINI_API_KEY found in .env - offline mode only.")
+        return 1
+    client = GeminiClient(s.gemini_api_key, s.gemini_model, s.gemini_fallback_model, s.request_timeout_s, 1)
+    ok = True
+    try:
+        vec = client.embed(["hello world"], "RETRIEVAL_QUERY", s.embedding_model, s.embedding_dim)[0]
+        print(f"[ OK ] embeddings: {s.embedding_model} -> {len(vec)} dimensions")
+    except Exception as exc:
+        ok = False
+        print(f"[FAIL] embeddings ({s.embedding_model}): {exc}")
+    try:
+        reply = client.generate("Reply with JSON only.", 'Return {"answer": "OK"}', json_mode=True)
+        print(f"[ OK ] generation: {client.last_model_used} replied {reply.strip()[:60]}")
+    except Exception as exc:
+        ok = False
+        print(f"[FAIL] generation ({s.gemini_model}): {exc}")
+    print("All good - run: python -m app.cli index" if ok else "Fix the errors above (see README > Troubleshooting).")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- main
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="nexacorp-rag")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("ingest", help="parse and chunk a folder of documents")
+    p = sub.add_parser("ingest", help="parse and chunk a folder of documents (no embeddings)")
     p.add_argument("input", nargs="?", default="data/raw")
     p.add_argument("--output", default="data/processed")
     p.add_argument("--max-chars", type=int, default=1000)
     p.add_argument("--show", type=int, default=0, help="print the first N chunks")
     p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("check", help="test the Gemini API key and models")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("index", help="parse, chunk, embed and store documents in the vector DB")
+    p.add_argument("input", nargs="?", default=None)
+    p.add_argument("--offline", action="store_true")
+    p.set_defaults(func=cmd_index)
+
+    for name, func, helptext in (("ask", cmd_ask, "ask one question"), ("chat", cmd_chat, "interactive questions")):
+        p = sub.add_parser(name, help=helptext)
+        if name == "ask":
+            p.add_argument("question", nargs="+")
+            p.add_argument("--json", action="store_true", help="print the full answer object as JSON")
+            p.add_argument("--status", nargs="+", help="metadata filter, e.g. --status current unspecified")
+            p.add_argument("--category", nargs="+", help="metadata filter, e.g. --category policy")
+            p.add_argument("--file", nargs="+", help="metadata filter on filename")
+        p.add_argument("--sources", action="store_true", help="also show the retrieved chunks")
+        p.add_argument("--offline", action="store_true")
+        p.set_defaults(func=func)
 
     args = parser.parse_args(argv)
     return args.func(args)

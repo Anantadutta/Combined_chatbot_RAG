@@ -9,3 +9,4 @@ data/index/
 data/uploads/
 *.egg-info/
 .DS_Store
+eval/results/

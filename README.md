@@ -5,7 +5,9 @@ It answers questions only from company documents, cites the exact file and locat
 prefers current documents over superseded and draft ones, and says so when the answer
 isn't in the documents.
 
-> **Status:** Steps 1-5 of 6 complete - ingestion, hybrid retrieval, reranking, cited Gemini answers, guardrails, a FastAPI backend with a web chat/upload UI, multi-turn chat, and document upload/update/delete/reindex.
+> **Status:** all 6 steps built - ingestion, hybrid retrieval, reranking, cited Gemini answers, guardrails, a FastAPI backend with a web chat/upload UI, multi-turn chat, document upload/update/delete/reindex, a batch evaluation harness, Docker and a Render deployment blueprint.
+>
+> **Live demo:** _(add the Render URL here after deploying)_
 
 ## Roadmap
 
@@ -16,7 +18,7 @@ isn't in the documents.
 | 3 | Current/superseded/draft handling, no-answer abstention, prompt-injection defence | ✅ done |
 | 4 | FastAPI backend + chat/upload UI, multi-turn chat | ✅ done |
 | 5 | Upload / update / delete / reindex, deduplication, ingestion status | ✅ done |
-| 6 | Evaluation harness, Docker, cloud deployment, architecture diagram | ⏳ |
+| 6 | Evaluation harness, Docker, cloud deployment, architecture diagram | ✅ done |
 
 ## Quick start
 
@@ -33,6 +35,7 @@ python -m app.cli index            # parse, chunk, embed and store data/raw in Q
 python -m app.cli ask "How many days per week can I work from home?" --sources
 python -m app.cli chat             # multi-turn chat in the terminal
 python -m app.cli serve            # web UI + API on http://127.0.0.1:8000 (API docs at /docs)
+python -m app.cli eval             # batch evaluation of eval/questions.csv -> eval/results/
 python -m pytest -q                # run the tests (no API key or network needed)
 ```
 
@@ -47,6 +50,63 @@ python -m app.cli ask "..." --status current unspecified  # metadata filter
 python -m app.cli ask "..." --category policy             # metadata filter
 python -m app.cli ingest data/raw --show 5              # parse + chunk only, write data/processed/
 ```
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Clients
+        UI["Web UI<br/>chat + upload"]
+        CLI["CLI<br/>ask / chat / eval"]
+        EV["Batch eval<br/>CSV in, CSV/JSON out"]
+    end
+
+    subgraph API["FastAPI (app/api/server.py)"]
+        CHAT["/api/chat, /api/ask"]
+        DOCS["/api/documents<br/>upload, update, delete"]
+        RX["/api/reindex, /api/jobs"]
+        SESS[("Chat sessions<br/>in memory")]
+    end
+
+    subgraph ING["Ingestion (app/ingestion)"]
+        VAL["Validate<br/>type, size, sha256 dedup"]
+        PAR["8 parsers<br/>PDF DOCX XLSX CSV JSON HTML TXT MD"]
+        META["Status detection<br/>current / superseded / draft"]
+        CHK["Structure-aware chunker"]
+    end
+
+    subgraph RAG["Question answering (app/rag, app/retrieval)"]
+        RW["Follow-up rewrite"]
+        HYB["Hybrid search<br/>Qdrant vectors + BM25<br/>Reciprocal Rank Fusion"]
+        RR["Reranker"]
+        POL["Authority policy<br/>drafts out, superseded as background"]
+        GEN["Gemini answer<br/>JSON + [S#] citations"]
+        GRD["Guardrails<br/>citation check, abstention,<br/>injection + leak detection"]
+    end
+
+    FILES[("data/raw + data/uploads")]
+    QD[("Qdrant<br/>local folder or Qdrant Cloud")]
+    GEM(["Google Gemini API<br/>embeddings + generation"])
+
+    UI --> CHAT & DOCS & RX
+    CLI --> RAG
+    EV -->|HTTP or in-process| CHAT
+    CHAT --> SESS
+    CHAT --> RW --> HYB --> RR --> POL --> GEN --> GRD
+    DOCS & RX --> VAL --> PAR --> META --> CHK
+    CHK -->|embed| GEM
+    CHK --> QD
+    FILES --> VAL
+    DOCS --> FILES
+    HYB --> QD
+    HYB -->|embed query| GEM
+    RW -.->|rewrite| GEM
+    GEN --> GEM
+```
+
+One process holds the engine. Ingestion writes chunks + metadata to Qdrant (the source of truth;
+the BM25 index is rebuilt from it). A question flows left to right through retrieval, the
+authority policy and generation, and every answer leaves through the guardrails.
 
 ## How ingestion works
 
@@ -224,6 +284,93 @@ server process; for several processes or machines set `QDRANT_URL` (Qdrant serve
 reindex (the UI has a field for it). Uploaded file names are reduced to their base name, the UI
 renders all document text as plain text, and errors never return stack traces.
 
+## Evaluation (`app/evaluation.py`)
+
+```bash
+python -m app.cli eval eval/questions.csv                     # local engine (uses Gemini if configured)
+python -m app.cli eval my_questions.csv --workers 4           # 4 questions / conversations in parallel
+python -m app.cli eval my_questions.csv --url https://<your-app>.onrender.com   # a deployed server
+```
+
+**Input** - a UTF-8 CSV with a header row. Only `question` is required; extra columns are copied
+to the output unchanged.
+
+| Column | Meaning |
+|---|---|
+| `id` | question id (default: row number) |
+| `question` | the question |
+| `expected_answer` | optional key: a value (`22`, `130000`, `2026-10-28`, `late sandbox credentials`), `NO_ANSWER` when the assistant should abstain, or alternatives separated by `\|` |
+| `expected_sources` | optional file names separated by `;` |
+| `conversation_id` | optional: rows with the same id are asked in order as one chat (follow-ups) |
+| `category` | optional label for the per-category summary |
+
+**Output** - `eval/results/<timestamp>/`:
+
+* `results.csv` - one row per question: `answer`, `abstained`, `confidence`, `cited_sources`
+  (file, location, status), `flags`, `standalone_question`, `model`, `rewrite_ms`, `retrieve_ms`,
+  `rerank_ms`, `generate_ms`, `total_ms` (engine), `wall_ms` (end to end), `answer_correct`,
+  `source_match`, `error`
+* `results.jsonl` - the same plus the complete API response (citation snippets, retrieved chunks)
+* `summary.json` - accuracy, source accuracy, answered / abstained / errors, latency mean / p50 /
+  p95 / max, throughput, accuracy per category
+
+**Scoring** is deterministic (no LLM judge): numbers in the key must all appear in the answer
+(`120,000` = `120000`, `2026-10-28` = `October 28, 2026`); without numbers, 60% of the key's
+words must appear; `NO_ANSWER` is correct when the assistant abstained. A question that errors
+is reported, not fatal. `eval/questions.csv` holds 19 sample questions covering the data traps,
+abstention, prompt injection and follow-ups.
+
+## Docker
+
+```bash
+docker build -t nexacorp-rag .
+docker run -p 8000:8000 --env-file .env nexacorp-rag          # http://localhost:8000
+docker run -p 8000:8000 --env-file .env -v nexacorp-data:/app/data nexacorp-rag   # keep index + uploads
+```
+
+The image (python:3.13-slim, non-root user, health check on `/health`) contains the code and
+`data/raw`; on first start the server indexes the corpus if the index is empty. It listens on
+`$PORT` (default 8000).
+
+## Deployment (Render)
+
+`render.yaml` is a Render Blueprint for a free Docker web service.
+
+1. Sign in at https://render.com with GitHub.
+2. **New -> Blueprint**, pick this repository, and confirm.
+3. When asked, paste your `GEMINI_API_KEY`. `ADMIN_TOKEN` is generated for you (copy it from
+   the service's **Environment** tab; the web UI needs it to upload or delete).
+4. Wait for the deploy to show **Live**, then open `https://<service-name>.onrender.com`.
+
+Every push to `main` redeploys. Check it with
+`python -m app.cli eval --url https://<service-name>.onrender.com`.
+
+The free plan sleeps after 15 minutes without traffic (the first request then takes about a
+minute) and its disk is temporary: on every restart the corpus is re-indexed from `data/raw`,
+and uploaded files are lost. To keep uploads, set `QDRANT_URL` / `QDRANT_API_KEY` to a free
+Qdrant Cloud cluster and attach a persistent disk at `/app/data` (paid plan).
+
+## Limitations
+
+* **Status detection is rule-based.** Current / superseded / draft come from filenames and banner
+  text near the top of a document ("Status: SUPERSEDED", "UNAPPROVED DRAFT"). A document that
+  states its status only in the middle, or in an unusual wording, is treated as reference material.
+* **Supersession is matched by topic and date.** A superseded document is linked to its successor
+  when their names share a topic or the dates line up; unrelated naming defeats this.
+* **Scanned PDFs and images** are not OCR'd; a PDF with no text layer is reported as failed.
+* **Tables inside PDFs** are read as text lines, not rows (DOCX/XLSX/CSV/HTML tables are rows).
+* **One server process** with local Qdrant (it locks its folder). Several processes need
+  `QDRANT_URL`. Chat sessions and job history are in memory and are lost on restart.
+* **Prompt-injection defence is layered, not perfect.** Patterns catch common attacks, the prompt
+  treats sources and questions as data, and a canary token blocks prompt leaks; a novel attack
+  phrasing may get past the detector (the model is still instructed to ignore it).
+* **Answer quality depends on Gemini.** Free-tier rate limits can slow batch runs (the client
+  retries). If Gemini is down, the most relevant passage is returned, marked as such.
+* **Evaluation scoring is lexical.** A correct answer phrased without the key's numbers or words
+  can be marked wrong; review `results.csv` for borderline cases.
+* **No user accounts.** Reading is open to anyone with the URL; writes need `ADMIN_TOKEN`. Every
+  question uses the deployer's Gemini quota.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -256,6 +403,7 @@ app/
   api/
     server.py             FastAPI app (chat, ask, documents, reindex, jobs)
     static/index.html     web chat + upload UI
+  evaluation.py           batch evaluation: CSV in -> results.csv / results.jsonl / summary.json
   ingestion/
     models.py             Section, ParsedDocument, Chunk
     parsers.py            one parser per format
@@ -265,5 +413,7 @@ app/
 data/index/               vector DB + embedding cache (created by `index`, not committed)
 data/uploads/             files added through the API / UI (not committed)
 data/raw/                 the NexaCorp source documents
-tests/                    unit + integration tests (pytest)
+eval/questions.csv        sample evaluation questions with answer key
+tests/                    unit + integration + evaluation tests (pytest)
+Dockerfile, render.yaml   container image and Render deployment blueprint
 ```

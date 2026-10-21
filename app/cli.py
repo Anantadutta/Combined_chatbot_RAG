@@ -5,6 +5,7 @@
     python -m app.cli ask "How many WFH days?"   # one question -> cited answer
     python -m app.cli chat                       # multi-turn chat in the terminal
     python -m app.cli serve                      # web UI + REST API on http://127.0.0.1:8000
+    python -m app.cli eval eval/questions.csv    # batch evaluation -> eval/results/<time>/
     python -m app.cli ingest data/raw --show 5   # parse + chunk only, write data/processed/
 Add --offline to any command to run without Gemini (hash embeddings, extractive answers).
 """
@@ -204,6 +205,51 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    import datetime as dt
+
+    from .evaluation import HttpBackend, LocalBackend, load_questions, run_evaluation, write_outputs
+
+    rows = load_questions(args.questions)
+    out = args.out or str(Path("eval") / "results" / dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    engine = None
+    if args.url:
+        backend, target = HttpBackend(args.url, args.timeout), args.url
+    else:
+        engine = _engine(args)
+        if _need_index(engine):
+            return 1
+        backend, target = LocalBackend(engine), "local engine"
+    print(f"Evaluating {len(rows)} questions against {target} with {args.workers} worker(s)...\n")
+
+    def progress(r):
+        mark = {True: "PASS", False: "FAIL", None: "    "}[r["answer_correct"]]
+        status = "ERROR " + r["error"][:60] if r["error"] else ("abstained" if r["abstained"] else "answered")
+        print(f"  {mark}  {r['id']:>6}  {r['wall_ms']:>7.0f} ms  {status:10}  {r['question'][:70]}")
+
+    try:
+        results, summary = run_evaluation(rows, backend, args.workers, progress)
+    finally:
+        if engine is not None:
+            engine.close()
+    meta = {"questions_file": str(args.questions), "target": target}
+    if engine is not None:
+        meta["settings"] = engine.settings.describe()
+    path = write_outputs(results, summary, out, meta)
+    acc = summary["answer_accuracy"]
+    src = summary["source_accuracy"]
+    lat = summary["latency_ms"]
+    print(f"\n{summary['questions']} questions: {summary['answered']} answered, {summary['abstained']} abstained, "
+          f"{summary['errors']} errors")
+    if acc is not None:
+        print(f"Answer accuracy: {summary['correct']}/{summary['scored']} = {acc:.0%}"
+              + (f"   Source accuracy: {src:.0%}" if src is not None else ""))
+    print(f"Latency: mean {lat['mean']:.0f} ms, p50 {lat['p50']:.0f} ms, p95 {lat['p95']:.0f} ms "
+          f"| {summary['throughput_qps']} questions/s")
+    print(f"-> {path}/results.csv, results.jsonl, summary.json")
+    return 0 if summary["errors"] == 0 else 1
+
+
 # ---------------------------------------------------------------- main
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -236,6 +282,15 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--sources", action="store_true", help="also show the retrieved chunks")
         p.add_argument("--offline", action="store_true")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("eval", help="batch-evaluate a CSV of questions")
+    p.add_argument("questions", nargs="?", default="eval/questions.csv")
+    p.add_argument("--out", help="output folder (default eval/results/<timestamp>)")
+    p.add_argument("--url", help="evaluate a running server instead, e.g. https://my-app.onrender.com")
+    p.add_argument("--workers", type=int, default=1, help="questions/conversations asked in parallel")
+    p.add_argument("--timeout", type=float, default=120.0, help="per-request timeout with --url (seconds)")
+    p.add_argument("--offline", action="store_true")
+    p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser("serve", help="run the web UI + REST API")
     p.add_argument("--host", default="127.0.0.1")

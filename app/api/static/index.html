@@ -63,6 +63,13 @@
   .examples { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
   .examples button { border: 1px solid var(--line); background: var(--panel); border-radius: 99px; padding: 6px 13px; cursor: pointer; font-size: 13px; }
   .examples button:hover { border-color: var(--accent); }
+  .msg.bot.welcome { line-height: 1.6; }
+  .welcome .examples { justify-content: flex-start; margin-top: 12px; }
+  .namerow { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .namerow input { flex: 1; min-width: 160px; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 7px 10px; }
+  .namerow input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .linkbtn { border: 0; background: none; padding: 0; color: var(--muted); font-size: 12.5px; cursor: pointer; text-decoration: underline; margin-top: 10px; }
+  .linkbtn:hover { color: var(--ink); }
   .msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-ink); padding: 9px 14px; border-radius: 14px 14px 4px 14px; max-width: 80%; white-space: pre-wrap; }
   .msg.bot { background: var(--panel); border: 1px solid var(--line); border-radius: 4px 14px 14px 14px; padding: 14px 16px; }
   .msg.bot.abstained { border-style: dashed; }
@@ -188,11 +195,89 @@ async function api(path, opts = {}) {
 }
 
 // ---------------------------------------------------------------- chat
-function showEmpty() {
-  inner.replaceChildren(el("div", { class: "empty" },
-    el("h2", {}, "Ask a question about NexaCorp"),
-    el("div", {}, "Every answer cites the document and location it came from. Follow-up questions keep the context."),
-    el("div", { class: "examples" }, EXAMPLES.map((t) => el("button", { onclick: () => ask(t) }, t)))));
+// ---------------------------------------------------------------- welcome + name
+// The name is kept only in this browser (localStorage) and is never sent to the server or to Gemini.
+function getName() { try { return localStorage.getItem("nx_name") || ""; } catch { return ""; } }
+function setName(n) { try { n ? localStorage.setItem("nx_name", n) : localStorage.removeItem("nx_name"); } catch {} }
+function cleanName(n) { return n.replace(/\s+/g, " ").trim().slice(0, 30).replace(/^\w/, (c) => c.toUpperCase()); }
+function chips() {
+  return el("div", { class: "examples" }, EXAMPLES.map((t) => el("button", { type: "button", onclick: () => ask(t) }, t)));
+}
+function botSay(...children) {
+  const box = el("div", { class: "msg bot welcome" }, ...children);
+  inner.append(box); scrollDown();
+  return box;
+}
+
+function showWelcome() {
+  inner.replaceChildren();
+  const name = getName();
+  if (name) {
+    botSay(el("div", {}, `Welcome back, ${name}! 👋 What can I help you with today?`),
+           el("div", { class: "examples-label foot" }, "Try one of these, or type your own question:"),
+           chips(),
+           el("button", { class: "linkbtn", type: "button", onclick: () => { setName(""); showWelcome(); } }, `Not ${name}?`));
+    return;
+  }
+  const input = el("input", { id: "nameinput", type: "text", maxlength: "30", placeholder: "Your name", autocomplete: "given-name" });
+  const box = botSay(
+    el("div", {}, "👋 Hi, welcome to the NexaCorp Assistant! I can answer questions about company policies, projects, " +
+                  "client SLAs and incidents, and I'll always show you which document the answer came from."),
+    el("div", { style: "margin-top:8px" }, "Before we start, what should I call you? ", el("span", { class: "foot", style: "display:inline" }, "(You can skip this.)")),
+    el("form", { class: "namerow", onsubmit: (e) => { e.preventDefault(); greetName(box, input.value); } },
+       input,
+       el("button", { class: "btn primary", type: "submit" }, "Continue"),
+       el("button", { class: "btn", type: "button", onclick: () => greetName(box, "") }, "Skip")),
+    el("div", { class: "foot jump" }, "Or jump straight in with a question:"),
+    chips());
+  setTimeout(() => input.focus(), 0);
+}
+
+function greetName(box, raw) {
+  const name = cleanName(raw || "");
+  box.querySelectorAll(".namerow, .jump, .examples").forEach((n) => n.remove());  // the reply below shows them again
+  if (name) {
+    setName(name);
+    inner.append(el("div", { class: "msg user" }, name));
+    botSay(el("div", {}, `Nice to meet you, ${name}! What would you like to know? Here are a few things people often ask:`), chips());
+  } else {
+    botSay(el("div", {}, "No problem! What would you like to know? Here are a few things people often ask:"), chips());
+  }
+  $("q").focus();
+}
+
+// ---------------------------------------------------------------- small talk
+// Only when the WHOLE message is small talk ("hi", "thanks"...). "hi, how many WFH days?" still goes to the documents.
+const SMALL_TALK = [
+  [/^(hi+|hello+|hey+|heya|hiya|yo|namaste|hola|good (morning|afternoon|evening|day))( there| bot| assistant| nexacorp)?$/,
+   (n) => [`Hi${n ? " " + n : ""}! What would you like to know about NexaCorp?`, true]],
+  [/^(how are you|how are you doing|how r u|how's it going|hows it going)$/,
+   (n) => [`I'm doing well, thanks for asking${n ? ", " + n : ""}! What can I help you find in the NexaCorp documents?`, true]],
+  [/^((ok(ay)?|great|cool|awesome|perfect) )?(thanks|thank you|thank u|thx|ty|thanks a lot|thank you so much|many thanks)( so much)?$/,
+   (n) => [`You're welcome${n ? ", " + n : ""}! Anything else I can help with?`, false]],
+  [/^(bye|goodbye|good bye|see you|see ya|cya|good night|that's all|thats all)$/,
+   (n) => [`Goodbye${n ? ", " + n : ""}! Come back anytime. 👋`, false]],
+  [/^(ok|okay|cool|nice|great|awesome|got it|perfect)$/,
+   () => ["Glad to help! Ask me anything else about NexaCorp.", false]],
+  [/^(help|what can you do|what do you do|how does this work|what can i ask( you)?|what should i ask)$/,
+   () => ["I answer questions using only NexaCorp's documents: HR policies (work from home, leave, expenses), " +
+          "projects and budgets (Orion, Atlas, Nebula), client SLAs, incidents, the API guide and announcements. " +
+          "Every answer shows the document and location it came from, and follow-up questions keep the context. Try one of these:", true]],
+  [/^(who are you|what are you|what is your name|whats your name|what's your name)$/,
+   () => ["I'm the NexaCorp Assistant. I answer from company documents only, and I always cite my sources. " +
+          "If something isn't in the documents, I'll tell you instead of guessing.", true]],
+];
+function smallTalkReply(text) {
+  const t = text.toLowerCase().replace(/[^a-z' ]/g, " ").replace(/\s+/g, " ").trim();
+  const name = getName();
+  const m = t.match(/^(my name is|my name's|call me) ([a-z][a-z' -]{0,29})$/);
+  if (m) {
+    const n = cleanName(m[2]);
+    setName(n);
+    return [`Nice to meet you, ${n}! What would you like to know?`, true];
+  }
+  for (const [re, reply] of SMALL_TALK) if (re.test(t)) return reply(name);
+  return null;
 }
 
 function renderAnswer(a) {
@@ -232,8 +317,16 @@ function scrollDown() { thread.scrollTop = thread.scrollHeight; }
 async function ask(question) {
   question = question.trim();
   if (!question || busy) return;
+  inner.querySelectorAll(".namerow").forEach((n) => n.remove());  // they chose to ask straight away
+  const small = smallTalkReply(question);
+  if (small) {
+    inner.append(el("div", { class: "msg user" }, question));
+    const [text, withChips] = small;
+    botSay(el("div", {}, text), withChips ? chips() : null);
+    $("q").focus();
+    return;
+  }
   busy = true; $("send").disabled = true;
-  if (inner.querySelector(".empty")) inner.replaceChildren();
   inner.append(el("div", { class: "msg user" }, question));
   const wait = el("div", { class: "typing" }, "Searching the documents");
   inner.append(wait); scrollDown();
@@ -255,7 +348,7 @@ function autosize() { const t = $("q"); t.style.height = "auto"; t.style.height 
 $("q").addEventListener("input", autosize);
 $("newchat").addEventListener("click", async () => {
   if (sessionId) { try { await api("/api/chat/" + sessionId, { method: "DELETE" }); } catch {} }
-  sessionId = null; showEmpty(); $("q").focus();
+  sessionId = null; showWelcome();
 });
 
 // ---------------------------------------------------------------- documents
@@ -315,7 +408,7 @@ async function loadStatus() {
   catch { $("status").textContent = "Server not reachable"; }
 }
 
-showEmpty(); loadDocs(); loadStatus(); $("q").focus();
+showWelcome(); loadDocs(); loadStatus();
 </script>
 </body>
 </html>
